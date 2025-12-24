@@ -17,9 +17,15 @@ local function resolve_model_opts(adapter)
     model = model(adapter)
   end
   if type(choices) == "function" then
-    choices = choices(adapter, { async = false })
+    -- Avoid blocking during initialization
+    choices = choices(adapter, { async = true })
   end
-  return choices[model]
+
+  if adapter.model and choices and choices[model] then
+    adapter.model.info = choices[model]
+  end
+
+  return choices and choices[model] or { opts = {} }
 end
 
 ---Return the handlers of a specific adapter, ensuring the correct endpoint is set
@@ -93,7 +99,7 @@ return {
   env = {
     ---@return string
     api_key = function()
-      return token.fetch().copilot_token
+      return token.fetch({ force = true }).copilot_token
     end,
   },
   headers = {
@@ -115,9 +121,14 @@ return {
       end
       _fetching_models = true
 
+      -- Defer token initialization - only fetch models in background without requiring tokens
       vim.schedule(function()
         pcall(function()
-          get_models.choices(self, { async = true })
+          -- Only fetch models if we already have a token cached, otherwise skip
+          local cached_token = token.fetch()
+          if cached_token and cached_token.copilot_token then
+            get_models.choices(self, { token = cached_token, async = true })
+          end
         end)
         _fetching_models = false
       end)
@@ -164,10 +175,98 @@ return {
         self.headers["X-Initiator"] = "agent"
       end
 
-      return handlers(self).form_messages(self, messages)
+      local result = handlers(self).form_messages(self, messages)
+
+      -- For gemini-3, merge consecutive LLM messages and ensure that reasoning
+      -- data is transformed. This enables consecutive tool calls to be made
+      if result.messages then
+        local merged = {}
+        local i = 1
+        while i <= #result.messages do
+          local current = result.messages[i]
+
+          -- gemini-3 requires reasoning_text and reasoning_opaque fields
+          if current.reasoning then
+            if current.reasoning.content then
+              current.reasoning_text = current.reasoning.content
+            end
+            if current.reasoning.opaque then
+              current.reasoning_opaque = current.reasoning.opaque
+            end
+            current.reasoning = nil
+          end
+
+          -- From investigating Copilot Chat's output, tool_calls are merged
+          -- into a single message per role with reasoning data
+          if
+            i < #result.messages
+            and result.messages[i + 1].role == current.role
+            and result.messages[i + 1].tool_calls
+            and not result.messages[i + 1].content
+          then
+            current.tool_calls = result.messages[i + 1].tool_calls
+            i = i + 1 -- Skip the next message since we merged it
+          end
+
+          table.insert(merged, current)
+          i = i + 1
+        end
+        result.messages = merged
+      end
+
+      return result
     end,
     form_tools = function(self, tools)
       return handlers(self).form_tools(self, tools)
+    end,
+    form_reasoning = function(self, data)
+      local content = vim
+        .iter(data)
+        :map(function(item)
+          return item.content
+        end)
+        :filter(function(content)
+          return content ~= nil
+        end)
+        :join("")
+
+      local opaque
+      for _, item in ipairs(data) do
+        if item.opaque then
+          opaque = item.opaque
+          break
+        end
+      end
+
+      return {
+        content = content,
+        opaque = opaque,
+      }
+    end,
+    ---Copilot with Gemini 3 provides reasoning data that must be sent back in responses
+    ---@param self CodeCompanion.HTTPAdapter
+    ---@param data table
+    ---@return table
+    parse_message_meta = function(self, data)
+      local extra = data.extra
+      if not extra then
+        return data
+      end
+
+      if extra.reasoning_text then
+        data.output.reasoning = data.output.reasoning or {}
+        data.output.reasoning.content = extra.reasoning_text
+      end
+      if extra.reasoning_opaque then
+        data.output.reasoning = data.output.reasoning or {}
+        data.output.reasoning.opaque = extra.reasoning_opaque
+      end
+
+      if data.output.content == "" then
+        data.output.content = nil
+      end
+
+      return data
     end,
     tokens = function(self, data)
       if data and data ~= "" then
@@ -187,7 +286,16 @@ return {
       end
     end,
     chat_output = function(self, data, tools)
-      return handlers(self).chat_output(self, data, tools)
+      if type(data) == "string" then
+        if data and data:match("quota") and data:match("exceeded") then
+          return {
+            status = "error",
+            output = "Your Copilot quota has been exceeded for this conversation",
+          }
+        end
+      end
+
+      return handlers(self).chat_output(self, data, tools, { adapter = "copilot" })
     end,
     tools = {
       format_tool_calls = function(self, tools)
@@ -216,12 +324,15 @@ return {
       default = "gpt-4.1",
       ---@type fun(self: CodeCompanion.HTTPAdapter, opts?: table): table
       choices = function(self, opts)
-        -- Ensure token is available before getting models
-        local fetched = token.fetch()
+        opts = opts or {}
+        -- Force token initialization for synchronous requests (user-initiated model selection)
+        -- Don't force for async requests (background operations)
+        local force = opts.async == false
+        local fetched = token.fetch({ force = force })
         if not fetched or not fetched.copilot_token then
           return { ["gpt-4.1"] = { opts = {} } }
         end
-        return get_models.choices(self, opts, fetched)
+        return get_models.choices(self, { token = fetched, async = opts.async })
       end,
     },
     ---@type CodeCompanion.Schema
@@ -231,7 +342,7 @@ return {
       type = "number",
       default = 0.1,
       ---@type fun(self: CodeCompanion.HTTPAdapter): boolean
-      condition = function(self)
+      enabled = function(self)
         local model = self.schema.model.default
         if type(model) == "function" then
           model = model()
@@ -244,7 +355,13 @@ return {
       order = 4,
       mapping = "parameters",
       type = "integer",
-      default = 16384,
+      default = function(self)
+        local model_opts = resolve_model_opts(self)
+        if model_opts.limits and model_opts.limits.max_output_tokens then
+          return tonumber(model_opts.limits.max_output_tokens)
+        end
+        return 16384
+      end,
       desc = "The maximum number of tokens to generate in the chat completion. The total length of input tokens and generated tokens is limited by the model's context length.",
     },
     ---@type CodeCompanion.Schema
@@ -254,7 +371,7 @@ return {
       type = "number",
       default = 1,
       ---@type fun(self: CodeCompanion.HTTPAdapter): boolean
-      condition = function(self)
+      enabled = function(self)
         local model = self.schema.model.default
         if type(model) == "function" then
           model = model()
@@ -270,7 +387,7 @@ return {
       type = "number",
       default = 1,
       ---@type fun(self: CodeCompanion.HTTPAdapter): boolean
-      condition = function(self)
+      enabled = function(self)
         local model = self.schema.model.default
         if type(model) == "function" then
           model = model()

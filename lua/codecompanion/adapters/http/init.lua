@@ -50,6 +50,7 @@ local function get_handler(adapter, name)
     parse_chat = "chat_output",
     parse_inline = "inline_output",
     parse_tokens = "tokens",
+    parse_meta = "parse_message_meta",
 
     -- tools
     format_calls = "format_tool_calls",
@@ -84,6 +85,7 @@ end
 ---@field parse_chat? fun(self: CodeCompanion.HTTPAdapter, data: string|table, tools?: table): { status: string, output: table }|nil
 ---@field parse_inline? fun(self: CodeCompanion.HTTPAdapter, data: string|table, context?: table): { status: string, output: string }|nil
 ---@field parse_tokens? fun(self: CodeCompanion.HTTPAdapter, data: table): number|nil
+---@field parse_message_meta? fun(self: CodeCompanion.HTTPAdapter, data: {status: string, output: {role: string?, content: string?}, extra: table}):{status: string, output: {role: string?, content: string?, reasoning:{content: string?}|table|nil}}
 
 ---@class CodeCompanion.HTTPAdapter.Handlers.Tools
 ---@field format_calls? fun(self: CodeCompanion.HTTPAdapter, tools: table): table
@@ -123,7 +125,7 @@ end
 ---@field temp? table A table to store temporary values which are not passed to the request
 ---@field raw? table Any additional curl arguments to pass to the request
 ---@field opts? table Additional options for the adapter
----@field model? { name: string, formatted_name?: string, vendor?: string, opts: table } The model to use for the request
+---@field model? {name: string, formatted_name?: string, vendor?: string, opts: table, info?: table } The model to use for the request
 ---@field handlers CodeCompanion.HTTPAdapter.Handlers Functions which link the output from the request to CodeCompanion
 ---@field schema table Set of parameters for the generative AI service that the user can customise in the chat buffer
 ---@field methods table Methods that the adapter can perform e.g. for Slash Commands
@@ -159,7 +161,7 @@ function Adapter:make_from_schema()
 
   -- Process regular schema values
   for key, value in pairs(self.schema) do
-    if type(value.condition) == "function" and not value.condition(self) then
+    if type(value.enabled) == "function" and not value.enabled(self) then
       goto continue
     end
 
@@ -237,21 +239,7 @@ function Adapter.extend(adapter, opts)
   if type(adapter) == "string" then
     ok, adapter_config = pcall(require, "codecompanion.adapters.http." .. adapter)
     if not ok then
-      -- TODO: Remove this in v18.0.0
-      -- START
-
-      -- Try new structure first
-      if config.adapters.http and config.adapters.http[adapter] then
-        adapter_config = config.adapters.http[adapter]
-      else
-        -- Fallback to root level for backwards compatibility
-        adapter_config = config.adapters[adapter]
-      end
-      -- END
-
-      --TODO: Uncomment this in v18.0.0
-      --adapter_config = config.adapters.http[adapter]
-
+      adapter_config = config.adapters.http[adapter]
       if adapter_config and type(adapter_config) == "function" then
         adapter_config = adapter_config()
       end
@@ -304,7 +292,7 @@ end
 ---@param opts? table
 ---@return CodeCompanion.HTTPAdapter
 function Adapter.resolve(adapter, opts)
-  adapter = adapter or config.strategies.chat.adapter
+  adapter = adapter or config.interactions.chat.adapter
   opts = opts or {}
 
   if type(adapter) == "table" then
